@@ -501,6 +501,20 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
             GGML_ASSERT(pool_size + reserve_size <= CUDA_POOL_VMM_MAX_SIZE);
 
+            // Pool extension via cuMem* must run with the device idle. Without
+            // this sync, cuMemSetAccess below can fire while previously-queued
+            // async kernels (compute, tensor copies) are still in flight on
+            // the default stream and return CUDA_ERROR_NOT_READY. The CU_CHECK
+            // macro hits GGML_ABORT on that error and the resulting
+            // signal/longjmp ends up corrupting the just-mapped region: the
+            // mapping is registered but access permissions are never set, so
+            // every subsequent read/write to it silently misbehaves. Easiest
+            // visible failure: prefix-cache snapshots stored into freshly
+            // extended pool memory return zeroed/garbled state on restore.
+            // Repro: any workload that queues compute then immediately
+            // alloc_ctx_tensors on the same backend.
+            CUDA_CHECK(cudaDeviceSynchronize());
+
             // allocate more physical memory
             CUmemAllocationProp prop = {};
             prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
