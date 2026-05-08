@@ -550,6 +550,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_SPARSE,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2355,6 +2356,19 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    // Block-sparse flash attention (pFlash).
+    // Selects top-scoring K-blocks dynamically based on alpha threshold.
+    // alpha=1.0 selects all blocks (equivalent to dense attention).
+    // Q: [D, S, H, B], K: [D, S, Hk, B], V: [D, S, Hk, B] (ggml layout)
+    // Returns: [D, H, S, B] F32 (same shape as ggml_flash_attn_ext output)
+    GGML_API struct ggml_tensor * ggml_flash_attn_sparse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            float                 scale,
+            float                 alpha);
 
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
