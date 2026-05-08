@@ -1,5 +1,7 @@
 #include "gated_delta_net.cuh"
+#ifndef GGML_USE_HIP
 #include <cuda_fp16.h>
+#endif
 #include <type_traits>
 
 // Tree-mode parent index sentinel: a node whose parent is the pre-block state
