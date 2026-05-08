@@ -24,6 +24,7 @@
 #include "fattn-sparse.cuh"
 #include "fattn.cuh"
 #include "common.cuh"
+#include "convert.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -81,6 +82,9 @@ __global__ void k_bf16_to_f32_flat(
 }
 
 void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // K/V may be quantized (Q8_0, Q4_0, etc.).  If so, we dequantize them to F16
+    // into temporary buffers before the S<->H transpose into BF16 pFlash layout.
+
     // When no sparse kernel is registered, fall back to dense FA.
     if (!s_sparse_kernel) {
         const enum ggml_op saved_op = dst->op;
@@ -144,8 +148,8 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // Allocate pFlash-layout BF16 buffers and convert with S<->H transpose for inputs.
     // Q: F32 ggml [B,H,S,D] -> BF16 pFlash [B,S,H,D]   (S<->H transpose)
-    // K: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D] (S<->H transpose)
-    // V: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D] (S<->H transpose)
+    // K: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D] (S<->H transpose; dequant if needed)
+    // V: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D] (S<->H transpose; dequant if needed)
     // O: pFlash [B,S,H,D] BF16 -> F32 into dst->data    (flat copy, no transpose)
 
     __nv_bfloat16 *Q_pf;
@@ -162,13 +166,35 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
     k_f32_to_bf16_transpose_sh<<<(Q_n + block - 1) / block, block, 0, stream>>>(
         (const float *)Q->data, Q_pf, B, S, H, D);
 
-    // K: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D]  (S<->H transpose)
+    // K: dequantize to F16 if needed, then transpose S<->H into BF16 pFlash layout.
+    half * K_f16_buf = nullptr;
+    const half * K_f16_src = nullptr;
+    if (K->type == GGML_TYPE_F16) {
+        K_f16_src = (const half *)K->data;
+    } else {
+        to_fp16_cuda_t to_fp16_k = ggml_get_to_fp16_cuda(K->type);
+        GGML_ASSERT(to_fp16_k != nullptr && "no F16 dequant for K type");
+        CUDA_CHECK(cudaMallocAsync(&K_f16_buf, (size_t)K_n * sizeof(half), stream));
+        to_fp16_k(K->data, K_f16_buf, K_n, stream);
+        K_f16_src = K_f16_buf;
+    }
     k_f16_to_bf16_transpose_sh<<<(K_n + block - 1) / block, block, 0, stream>>>(
-        (const half *)K->data, K_pf, B, S, Hk, D);
+        K_f16_src, K_pf, B, S, Hk, D);
 
-    // V: F16 ggml [B,Hk,S,D] -> BF16 pFlash [B,S,Hk,D]  (S<->H transpose)
+    // V: dequantize to F16 if needed, then transpose S<->H into BF16 pFlash layout.
+    half * V_f16_buf = nullptr;
+    const half * V_f16_src = nullptr;
+    if (V->type == GGML_TYPE_F16) {
+        V_f16_src = (const half *)V->data;
+    } else {
+        to_fp16_cuda_t to_fp16_v = ggml_get_to_fp16_cuda(V->type);
+        GGML_ASSERT(to_fp16_v != nullptr && "no F16 dequant for V type");
+        CUDA_CHECK(cudaMallocAsync(&V_f16_buf, (size_t)K_n * sizeof(half), stream));
+        to_fp16_v(V->data, V_f16_buf, K_n, stream);
+        V_f16_src = V_f16_buf;
+    }
     k_f16_to_bf16_transpose_sh<<<(K_n + block - 1) / block, block, 0, stream>>>(
-        (const half *)V->data, V_pf, B, S, Hk, D);
+        V_f16_src, V_pf, B, S, Hk, D);
 
     // Call the registered pFlash kernel.
     // Expects Q[B,S,H,D], K[B,S,Hk,D], V[B,S,Hk,D], O[B,S,H,D] all BF16 contiguous.
@@ -181,6 +207,9 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
     k_bf16_to_f32_flat<<<(O_n + block - 1) / block, block, 0, stream>>>(
         O_pf, (float *)dst->data, O_n);
 
+    // Free temporary F16 dequant buffers (if allocated) then pFlash BF16 buffers.
+    if (K_f16_buf) CUDA_CHECK(cudaFreeAsync(K_f16_buf, stream));
+    if (V_f16_buf) CUDA_CHECK(cudaFreeAsync(V_f16_buf, stream));
     CUDA_CHECK(cudaFreeAsync(Q_pf, stream));
     CUDA_CHECK(cudaFreeAsync(K_pf, stream));
     CUDA_CHECK(cudaFreeAsync(V_pf, stream));
