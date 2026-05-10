@@ -388,11 +388,9 @@ static __global__ void k_chunked_dequant_tq3_0_f32(
             out_blk[i] = d_tq3_centroids[low2 | (hi1 << 2)] * norm;
         }
     }
-    if (kv_start == 0 && kv_local == 0 && h == 0 && threadIdx.x == 0) {
-        printf("[TQ3-DEQ] D=%d K128=", (int)D);
-        for (int i = 0; i < 128; i++) printf("%.4f,", out[i]);
-        printf("\n");
-    }
+    // (removed [TQ3-DEQ] debug printf — was left in by commit 694cea5e1
+    //  and tanks TQ3-path performance by ~8x even with the leading-thread
+    //  predicate.  Re-enable behind DFLASH_TQ3_DEQ_TRACE if needed.)
 }
 
 // Launch helper: dispatch by ggml type. Returns false if unsupported.
