@@ -379,7 +379,8 @@ static __global__ void cpy_f32_tq3_0_kernel(
     const int64_t ne10, const int64_t ne11, const int64_t ne12,
     const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
 
-    const int64_t group = (int64_t)blockDim.x * blockIdx.x + threadIdx.x;
+    // One warp per group: 32 threads cooperate on one 128-element group.
+    const int64_t group = blockIdx.x;
     const int64_t i = group * QK_TQ3_0_GROUP;
 
     if (i >= ne) return;
@@ -399,7 +400,7 @@ static __global__ void cpy_f32_tq3_0_kernel(
     const float * src = (const float *)(cx + x_offset);
     block_tq3_0 * dst_blocks = (block_tq3_0 *)(cdst + dst_offset);
 
-    quantize_f32_tq3_0_group(src, dst_blocks);
+    warp_quantize_f32_tq3_0_group(src, dst_blocks);
 }
 
 static void ggml_cpy_f32_tq3_0_cuda(
@@ -412,7 +413,10 @@ static void ggml_cpy_f32_tq3_0_cuda(
     GGML_ASSERT(ne % QK_TQ3_0_GROUP == 0);
     const int64_t num_groups = ne / QK_TQ3_0_GROUP;
     GGML_ASSERT(num_groups < UINT_MAX);
-    cpy_f32_tq3_0_kernel<<<num_groups, 1, 0, stream>>>
+    // One warp (32 threads) per group: each warp cooperatively quantizes one
+    // 128-element group via warp_quantize_f32_tq3_0_group (no stack spill, no
+    // single-thread FWHT).
+    cpy_f32_tq3_0_kernel<<<num_groups, 32, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
