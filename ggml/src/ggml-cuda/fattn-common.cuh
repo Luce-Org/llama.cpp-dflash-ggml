@@ -589,7 +589,7 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_0(
     // Mirror the f16/bf16 vec_dot loop structure so K-pair access aligns with the
     // Q_reg layout produced by fattn-vec.cuh's Q-loader (Q_q8_1=false branch):
     // each thread holds cpy_ne consecutive Q-pairs starting at offset (tid%nthreads)*cpy_ne
-    // within an outer chunk of nthreads*cpy_ne pairs. See bench/test_qreg_layout.cu for proof.
+    // within an outer chunk of nthreads*cpy_ne pairs.
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
