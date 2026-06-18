@@ -82,6 +82,9 @@
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <thread>
+#include <array>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -119,11 +122,82 @@ int ggml_cuda_get_device() {
     return id;
 }
 
-static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+// dflash: auto-enable unified (managed) memory on integrated GPUs (APU shared RAM)
+// ONLY for allocations large enough that a plain device buffer plus the mmap source
+// page cache (~2x size) would not fit in RAM and would thrash (e.g. an ~86GB DeepSeek-V4
+// model on a 125GB box). Managed memory has measurable alloc + access overhead on
+// this APU, so small models that fit stay on the faster hipMalloc path (verified:
+// 16GB model loads 3s / decodes 11.8 tok/s on hipMalloc vs 15s / 10.9 on managed).
+// The cached ggml_cuda_info().devices[].integrated is hard-forced false (#15034
+// dodge), so probe a FRESH cudaDeviceProp. Opt out: DFLASH_HIP_NO_AUTO_UMA=1.
+// Force-all: GGML_CUDA_ENABLE_UNIFIED_MEMORY. Tune gate: DFLASH_HIP_UMA_MIN_FRAC.
+static size_t ggml_cuda_total_ram_bytes() {
+    static const size_t cached = []() -> size_t {
+        size_t bytes = 0;
+        FILE * f = fopen("/proc/meminfo", "r");
+        if (f) {
+            char line[256];
+            unsigned long kb = 0;
+            while (fgets(line, sizeof(line), f)) {
+                if (sscanf(line, "MemTotal: %lu kB", &kb) == 1) { bytes = (size_t) kb * 1024; break; }
+            }
+            fclose(f);
+        }
+        return bytes;
+    }();
+    return cached;
+}
+
+static bool ggml_cuda_device_use_uma(int device, size_t size) {
+    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+        return true;
+    }
+    if (getenv("DFLASH_HIP_NO_AUTO_UMA") != nullptr) {
+        return false;
+    }
+    static const std::array<bool, GGML_CUDA_MAX_DEVICES> integrated = []() {
+        std::array<bool, GGML_CUDA_MAX_DEVICES> flags{};
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess) { n = 0; }
+        for (int i = 0; i < n && i < GGML_CUDA_MAX_DEVICES; i++) {
+            cudaDeviceProp prop;
+            flags[i] = (cudaGetDeviceProperties(&prop, i) == cudaSuccess && prop.integrated);
+        }
+        return flags;
+    }();
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES || !integrated[device]) {
+        return false;
+    }
+    size_t total_ram = ggml_cuda_total_ram_bytes();
+    if (total_ram == 0) {
+        return false; // unknown RAM: stay conservative on the legacy path
+    }
+    double frac = 0.45;
+    const char * fenv = getenv("DFLASH_HIP_UMA_MIN_FRAC");
+    if (fenv != nullptr) {
+        double v = atof(fenv);
+        if (v > 0.0 && v < 1.0) { frac = v; }
+    }
+    bool use = (double) size > frac * (double) total_ram;
+    if (use) {
+        GGML_LOG_INFO("ggml_cuda: device %d integrated, alloc %.1f GiB (> %.0f%% of %.1f GiB RAM) "
+                      "-> unified (managed) memory; small models stay on hipMalloc "
+                      "(DFLASH_HIP_NO_AUTO_UMA=1 to disable)\n",
+                      device, (double) size / 1073741824.0, frac * 100.0,
+                      (double) total_ram / 1073741824.0);
+    }
+    return use;
+}
+
+static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device, bool * out_managed = nullptr) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+    bool managed = false;
+    if (ggml_cuda_device_use_uma(device, size)) {
         err = cudaMallocManaged(ptr, size);
+        if (err == cudaSuccess) {
+            managed = true;
+        }
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
             // hipMemAdviseSetCoarseGrain is an optional performance hint;
@@ -141,10 +215,14 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
             }
 
             err = cudaMalloc(ptr, size);
+            managed = false;
         }
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+    }
+    if (out_managed != nullptr) {
+        *out_managed = managed && (err == cudaSuccess);
     }
     return err;
 }
@@ -633,6 +711,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool is_managed = false; // dflash: dev_ptr is unified/managed (CPU-addressable)
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -657,6 +736,15 @@ static bool ggml_backend_buffer_is_cuda(ggml_backend_buffer_t buffer) {
 static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     return ctx->dev_ptr;
+}
+
+// dflash: query whether a buffer is unified/managed (CPU-addressable) so loaders can
+// stream weights straight into it with explicit reads instead of a host->device copy.
+extern "C" bool ggml_backend_cuda_buffer_is_managed(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    return ((ggml_backend_cuda_buffer_context *) buffer->context)->is_managed;
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -692,6 +780,40 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->is_managed) {
+        // Unified/managed memory is CPU-addressable: copy weights straight in with a
+        // host memcpy, skipping the pageable host->device staged copy + per-tensor
+        // synchronize that dominate large-model load on shared-memory (integrated)
+        // GPUs. GPU visibility is established by the backend synchronize before the
+        // first graph compute.
+        char * dst = (char *) tensor->data + offset;
+        const char * src = (const char *) data;
+        const size_t par_threshold = (size_t) 16 * 1024 * 1024;
+        unsigned nth = std::thread::hardware_concurrency();
+        if (nth == 0) nth = 4;
+        if (nth > 16) nth = 16;
+        if (size >= par_threshold && nth > 1) {
+            // Split large copies across threads so cold-cache page-ins and the
+            // RAM->RAM copy run in parallel (disjoint byte ranges, no sharing).
+            std::vector<std::thread> workers;
+            workers.reserve(nth);
+            const size_t chunk = (size + nth - 1) / nth;
+            for (unsigned t = 0; t < nth; t++) {
+                const size_t s0 = (size_t) t * chunk;
+                if (s0 >= size) break;
+                const size_t n = (chunk < size - s0) ? chunk : (size - s0);
+                workers.emplace_back([dst, src, s0, n]() {
+                    memcpy(dst + s0, src + s0, n);
+                });
+            }
+            for (auto & w : workers) {
+                w.join();
+            }
+        } else {
+            memcpy(dst, src, size);
+        }
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -789,7 +911,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
-    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    bool is_managed = false;
+    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device, &is_managed);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -798,6 +921,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     }
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
+    ctx->is_managed = is_managed;
 
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
 }
