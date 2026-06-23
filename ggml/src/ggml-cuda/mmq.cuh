@@ -101,7 +101,28 @@ struct tile_x_sizes {
     int sc;
 };
 
+// Lucebox: smaller MMQ tile for RDNA3/RDNA4 spec-decode verify batches.
+// DFlash issues many small mul_mat_q calls (ne[1] ~= ddtree_budget+1, ~23 at
+// the default budget=22) where the stock 128x128 / 8-warp tile under-occupies.
+// A 48x64 tile with 4 warps is faster there, output bit-identical. Measured on
+// Qwen3.6-27B Q4_K_M at --ddtree-budget=22:
+//   gfx1100 (RX 7900 XTX): 56.78 -> 60.18 tok/s (+6.0%)
+//   gfx1201 (R9700):       54.65 -> 59.20 tok/s (+8.3%)
+// (mmq_y, nwarps) is the active lever (static_assert needs nwarps*16==mmq_y);
+// mmq_x_max in [32,64] is within noise. gfx1151/RDNA3.5 is left on the default
+// (not benchmarked here). Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0 to disable.
+#ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
+#define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
+#endif
+#define LUCEBOX_RDNA_TILE_HOST(cc) (LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)))
+#if LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (defined(RDNA3_0) || defined(RDNA4))
+#define LUCEBOX_RDNA_TILE_DEVICE 1
+#else
+#define LUCEBOX_RDNA_TILE_DEVICE 0
+#endif
+
 static int get_mmq_x_max_host(const int cc) {
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 48;
     return (amd_mfma_available(cc) || turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
 #ifdef GGML_CUDA_FORCE_MMQ
@@ -112,6 +133,9 @@ static int get_mmq_x_max_host(const int cc) {
 }
 
 static constexpr __device__ int get_mmq_x_max_device() {
+#if LUCEBOX_RDNA_TILE_DEVICE
+    return 48;
+#endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 128;
 #else // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
@@ -135,6 +159,7 @@ static constexpr __device__ int get_mmq_x_max_device() {
 }
 
 static int get_mmq_y_host(const int cc) {
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 64;
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
 }
@@ -148,6 +173,9 @@ static constexpr __device__ int get_iter_k([[maybe_unused]] const ggml_type type
 }
 
 static constexpr __device__ int get_mmq_y_device() {
+#if LUCEBOX_RDNA_TILE_DEVICE
+    return 64;
+#endif
 #if defined(GGML_USE_HIP)
 #if defined(RDNA1)
     return 64;
@@ -284,6 +312,7 @@ static constexpr __device__ int mmq_get_granularity_device(const int /*mmq_x*/) 
 
 #if defined(GGML_USE_HIP)
 static int mmq_get_nwarps_host(const int cc, const int warp_size) {
+    if (LUCEBOX_RDNA_TILE_HOST(cc)) return 4;
     return amd_mfma_available(cc) ? 8 : 256/warp_size;
 }
 #else
@@ -293,6 +322,9 @@ static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
 #endif // (GGML_USE_HIP)
 
 static constexpr __device__ int mmq_get_nwarps_device() {
+#if LUCEBOX_RDNA_TILE_DEVICE
+    return 4;
+#endif
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     return 8;
 #else
