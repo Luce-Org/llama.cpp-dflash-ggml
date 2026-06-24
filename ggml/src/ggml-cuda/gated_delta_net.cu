@@ -26,6 +26,22 @@ static __device__ __forceinline__ void store_inter_state(__half * p, int idx, fl
     p[idx] = __float2half(v);
 }
 
+__device__ __forceinline__ float gdn_subgroup_sum_lane0(float value, int width) {
+    const int lane = threadIdx.x % width;
+    for (int offset = width / 2; offset > 0; offset >>= 1) {
+        const int src_lane = lane < offset ? lane + offset : lane;
+        const float other = __shfl_sync(0xffffffffU, value, src_lane, width);
+        if (lane < offset) {
+            value += other;
+        }
+    }
+    return value;
+}
+
+__device__ __forceinline__ float gdn_subgroup_broadcast_lane0(float value, int width) {
+    return __shfl_sync(0xffffffffU, value, 0, width);
+}
+
 template <int S_v, bool KDA, bool TREE_MODE, typename InterT = float>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -245,6 +261,183 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+template <int S_v, int COLS, int WIDTH, int WARP_THREADS, typename InterT = float>
+__global__ void __launch_bounds__(WARP_THREADS * 8, 2)
+gated_delta_net_cuda_grouped_cols(const float * q,
+                                  const float * k,
+                                  const float * v,
+                                  const float * g,
+                                  const float * beta,
+                                  const float * curr_state,
+                                  float *       dst,
+                                  InterT *      persist_inter,
+                                  int64_t       H,
+                                  int64_t       n_tokens,
+                                  int64_t       n_seqs,
+                                  int64_t       sq1,
+                                  int64_t       sq2,
+                                  int64_t       sq3,
+                                  int64_t       sv1,
+                                  int64_t       sv2,
+                                  int64_t       sv3,
+                                  int64_t       sb1,
+                                  int64_t       sb2,
+                                  int64_t       sb3,
+                                  const uint3   neqk1_magic,
+                                  const uint3   rq3_magic,
+                                  float         scale) {
+    static_assert(S_v == 128, "grouped GDN kernel is specialized for S_v=128");
+    static_assert(WIDTH == 16, "grouped GDN kernel expects 16-lane subgroups");
+    static_assert(COLS == 4, "grouped GDN kernel expects 4 columns per subgroup");
+    static_assert(WARP_THREADS == 32 || WARP_THREADS == 64, "grouped GDN kernel expects 32- or 64-lane warps");
+
+    constexpr int subgroups_per_warp = WARP_THREADS / WIDTH;
+    constexpr int rows_per_lane      = (S_v + WIDTH - 1) / WIDTH;
+
+    const int h_idx    = blockIdx.x;
+    const int sequence = blockIdx.y;
+    const int subgroup = threadIdx.x / WIDTH;
+    const int lane     = threadIdx.x % WIDTH;
+
+    const int group_base = (blockIdx.z * blockDim.y + threadIdx.y) * subgroups_per_warp + subgroup;
+    const int col_base   = group_base * COLS;
+
+    if (col_base >= S_v) {
+        return;
+    }
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t final_state_elems = S_v * S_v * H * n_seqs;
+    float *       attn_data        = dst;
+    float *       state            = dst + attn_score_elems;
+    InterT *      inter_states     = persist_inter
+        ? persist_inter
+        : (InterT *)(dst + attn_score_elems + final_state_elems);
+
+    const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
+    state += state_offset;
+    curr_state += state_offset;
+    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+    InterT * inter_base = inter_states + (sequence * n_tokens * H + h_idx) * S_v * S_v;
+
+    float state_shard[COLS][rows_per_lane];
+
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int col = col_base + c;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r * WIDTH + lane;
+            state_shard[c][r] = curr_state[col * S_v + row];
+        }
+    }
+
+    for (int t = 0; t < n_tokens; ++t) {
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+
+        float g_val = 0.0f;
+        float beta_val = 0.0f;
+        if (threadIdx.x == 0) {
+            g_val = expf(g[gb_offset]);
+            beta_val = beta[gb_offset];
+        }
+        g_val = __shfl_sync(0xffffffffU, g_val, 0);
+        beta_val = __shfl_sync(0xffffffffU, beta_val, 0);
+
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+        float kv_partial[COLS];
+
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            kv_partial[c] = 0.0f;
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r * WIDTH + lane;
+            const float q_val = q_t[row];
+            const float k_val = k_t[row];
+            q_reg[r] = q_val;
+            k_reg[r] = k_val;
+
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                kv_partial[c] += state_shard[c][r] * k_val;
+            }
+        }
+
+        float delta[COLS];
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const float kv_col = gdn_subgroup_sum_lane0(kv_partial[c], WIDTH);
+            float delta_val = 0.0f;
+            if (lane == 0) {
+                delta_val = (v_t[col_base + c] - g_val * kv_col) * beta_val;
+            }
+            delta[c] = gdn_subgroup_broadcast_lane0(delta_val, WIDTH);
+        }
+
+        float attn_partial[COLS];
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            attn_partial[c] = 0.0f;
+        }
+
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                const float new_state = fmaf(k_reg[r], delta[c], g_val * state_shard[c][r]);
+                state_shard[c][r] = new_state;
+                attn_partial[c] += new_state * q_reg[r];
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            attn_partial[c] = gdn_subgroup_sum_lane0(attn_partial[c], WIDTH);
+        }
+
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < COLS; ++c) {
+                attn_data[col_base + c] = attn_partial[c] * scale;
+            }
+        }
+
+#pragma unroll
+        for (int c = 0; c < COLS; ++c) {
+            const int col = col_base + c;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; ++r) {
+                const int row = r * WIDTH + lane;
+                store_inter_state(inter_base, col * S_v + row, state_shard[c][r]);
+            }
+        }
+
+        attn_data += S_v * H;
+        inter_base += S_v * S_v * H;
+    }
+
+#pragma unroll
+    for (int c = 0; c < COLS; ++c) {
+        const int col = col_base + c;
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; ++r) {
+            const int row = r * WIDTH + lane;
+            state[col * S_v + row] = state_shard[c][r];
+        }
+    }
+}
+
 template <bool KDA, bool TREE_MODE, typename InterT = float>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -290,10 +483,47 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
-            gated_delta_net_cuda<128, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            if constexpr (!KDA && !TREE_MODE) {
+                if ((GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE) ||
+                    GGML_CUDA_CC_IS_AMD(cc)) {
+                    constexpr int cols = 4;
+                    constexpr int width = 16;
+                    constexpr int column_groups_per_block = 8;
+                    const int groups = 128 / cols;
+                    if (warp_size == 32) {
+                        constexpr int groups_per_warp = 32 / width;
+                        dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
+                        dim3 grouped_block_dims(32, column_groups_per_block, 1);
+                        gated_delta_net_cuda_grouped_cols<128, cols, width, 32, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
+                            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, persist_inter_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    } else if (warp_size == 64) {
+                        constexpr int groups_per_warp = 64 / width;
+                        dim3 grouped_grid_dims(H, n_seqs, (groups + column_groups_per_block * groups_per_warp - 1) / (column_groups_per_block * groups_per_warp));
+                        dim3 grouped_block_dims(64, column_groups_per_block, 1);
+                        gated_delta_net_cuda_grouped_cols<128, cols, width, 64, InterT><<<grouped_grid_dims, grouped_block_dims, 0, stream>>>(
+                            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, persist_inter_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    } else {
+                        gated_delta_net_cuda<128, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
+                            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+                            n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                            sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                    }
+                } else {
+                    gated_delta_net_cuda<128, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
+                        q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                }
+            } else {
+                gated_delta_net_cuda<128, KDA, TREE_MODE, InterT><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, parent_ids_d, persist_inter_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+            }
             break;
         }
         default:
