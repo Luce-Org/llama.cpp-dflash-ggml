@@ -108,14 +108,15 @@ struct tile_x_sizes {
 // Qwen3.6-27B Q4_K_M at --ddtree-budget=22:
 //   gfx1100 (RX 7900 XTX): 56.78 -> 60.18 tok/s (+6.0%)
 //   gfx1201 (R9700):       54.65 -> 59.20 tok/s (+8.3%)
+//   gfx1151 (Strix Halo):  11.53 -> 12.00 tok/s (+4.1%, 256-token smoke)
 // (mmq_y, nwarps) is the active lever (static_assert needs nwarps*16==mmq_y);
-// mmq_x_max in [32,64] is within noise. gfx1151/RDNA3.5 is left on the default
-// (not benchmarked here). Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0 to disable.
+// mmq_x_max in [32,64] is within noise. Define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE=0
+// to disable.
 #ifndef LUCEBOX_RDNA_MMQ_TILE_OVERRIDE
 #define LUCEBOX_RDNA_MMQ_TILE_OVERRIDE 1
 #endif
-#define LUCEBOX_RDNA_TILE_HOST(cc) (LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (GGML_CUDA_CC_IS_RDNA3_0(cc) || GGML_CUDA_CC_IS_RDNA4(cc)))
-#if LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (defined(RDNA3_0) || defined(RDNA4))
+#define LUCEBOX_RDNA_TILE_HOST(cc) (LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)))
+#if LUCEBOX_RDNA_MMQ_TILE_OVERRIDE && (defined(RDNA3) || defined(RDNA4))
 #define LUCEBOX_RDNA_TILE_DEVICE 1
 #else
 #define LUCEBOX_RDNA_TILE_DEVICE 0
@@ -4218,4 +4219,3 @@ void ggml_cuda_op_mul_mat_q(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
-
