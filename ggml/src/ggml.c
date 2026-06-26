@@ -7928,3 +7928,27 @@ struct ggml_tensor * ggml_moe_fused(
 
     return result;
 }
+
+struct ggml_tensor * ggml_laguna_moe_combine(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * expert_weights) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+    GGML_ASSERT(experts->ne[1] == expert_weights->ne[0]);
+    GGML_ASSERT(experts->ne[2] == expert_weights->ne[1]);
+
+    const int64_t ne[4] = { experts->ne[0], experts->ne[2], 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne);
+
+    result->op = GGML_OP_MOE_FUSED;
+    result->src[0] = experts;
+    result->src[1] = expert_weights;
+
+    ggml_set_op_params_i32(result, 0, -1);
+    ggml_set_op_params_i32(result, 1, (int32_t) experts->ne[0]);
+    ggml_set_op_params_i32(result, 2, (int32_t) experts->ne[1]);
+    ggml_set_op_params_i32(result, 3, (int32_t) experts->ne[2]);
+
+    return result;
+}
