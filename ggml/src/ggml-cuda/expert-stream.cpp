@@ -60,6 +60,10 @@ bool residency_planner::is_resident(int e) const {
     return e >= 0 && e < n_experts_ && resident_[e];
 }
 
+double residency_planner::usage(int e) const {
+    return (e >= 0 && e < n_experts_) ? score_[e] : 0.0;
+}
+
 std::vector<int> plan_prefetch(const std::vector<int>  & predicted_experts,
                                const std::vector<uint8_t> & resident_mask,
                                int max_prefetch) {

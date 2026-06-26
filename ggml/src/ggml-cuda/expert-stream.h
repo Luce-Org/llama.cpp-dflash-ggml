@@ -38,6 +38,7 @@ public:
     const std::vector<uint8_t> & resident_mask() const { return resident_; } // size n_experts, 1=resident
     std::vector<int>             resident_set()  const;                       // sorted resident ids
     bool                         is_resident(int e) const;
+    double                       usage(int e) const;                          // decayed use score (for LFU eviction)
 
 private:
     void update_residency();

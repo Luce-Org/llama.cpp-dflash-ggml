@@ -47,6 +47,7 @@ public:
     bool         is_resident(int e) const { return slot_of_[e] >= 0; }
     const void * device_ptr(int e) const;
     int          resident_count() const;
+    long         h2d_copies = 0;   // count of host->device expert streams issued (telemetry)
 
 private:
     int                     pick_victim_slot(int incoming);
@@ -61,6 +62,7 @@ private:
     char *                   dev_ = nullptr;             // n_slots_ * bytes_
     std::vector<int>         slot_of_;                   // expert -> slot, or -1
     std::vector<int>         expert_in_;                 // slot   -> expert, or -1
+    std::vector<uint8_t>     protected_;                 // expert -> 1 if in current step's working set
     std::vector<cudaEvent_t> ready_;                     // per-slot "copy done" event
     residency_planner        planner_;
 };
