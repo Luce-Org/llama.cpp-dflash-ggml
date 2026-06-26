@@ -12,6 +12,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -31,7 +32,7 @@ static const int N_COLS   = 128;  // contraction dim (mult of 32)
 static const int BPR      = N_COLS / 32; // blocks per row
 
 static inline float deq(const block_q4_0& b, int col) {
-    const int bj = col >> 5, i = col & 31;
+    const int i = col & 31;
     const float d = __half2float(b.d);
     const int q = (i < 16) ? (b.qs[i] & 0x0F) : (b.qs[i - 16] >> 4);
     return d * (q - 8);
