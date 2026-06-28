@@ -2394,6 +2394,11 @@ extern "C" {
             int64_t               ff_dim,
             int64_t               n_expert_used);
 
+    GGML_API struct ggml_tensor * ggml_laguna_moe_combine(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * expert_weights);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

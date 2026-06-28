@@ -1822,6 +1822,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
             } break;
+        case GGML_OP_MOE_FUSED:
+            {
+                GGML_ABORT("GGML_OP_MOE_FUSED is only implemented for CUDA");
+            }
         case GGML_OP_OUT_PROD:
             {
                 ggml_compute_forward_out_prod(params, tensor);
@@ -1981,7 +1985,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_FLASH_ATTN_SPARSE:
             {
                 GGML_ABORT("GGML_OP_FLASH_ATTN_SPARSE is only supported on the CUDA backend");
-            } break;
+            }
         case GGML_OP_FLASH_ATTN_BACK:
             {
                 int32_t t = ggml_get_op_params_i32(tensor, 0);
@@ -2017,7 +2021,7 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 // CUDA-only op; CPU fallback is identity (no rotation)
                 GGML_ASSERT(false && "TURBO_WHT is CUDA-only, use CUDA backend");
-            } break;
+            }
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);
