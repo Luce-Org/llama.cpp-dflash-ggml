@@ -173,6 +173,125 @@ __global__ void k_flash_attn_tree_q8_0_d128(
     dst_row[d] = ss > 0.0f ? acc / ss : 0.0f;
 }
 
+template <int Q_TILE>
+__global__ void k_flash_attn_tree_q8_0_d128_qtile(
+        const char * __restrict__ Q,
+        const char * __restrict__ K,
+        const char * __restrict__ V,
+        const char * __restrict__ mask,
+        char       * __restrict__ dst,
+        const float scale,
+        const int32_t n_q,
+        const int32_t n_head,
+        const int32_t n_head_kv,
+        const int32_t n_kv,
+        const int32_t n_batch,
+        const int64_t q_nb1,
+        const int64_t q_nb2,
+        const int64_t q_nb3,
+        const int64_t k_nb1,
+        const int64_t k_nb2,
+        const int64_t k_nb3,
+        const int64_t v_nb1,
+        const int64_t v_nb2,
+        const int64_t v_nb3,
+        const int64_t m_nb1,
+        const int64_t m_nb3,
+        const int64_t d_nb1,
+        const int64_t d_nb2,
+        const int64_t d_nb3) {
+    constexpr int D = 128;
+    const int q0 = blockIdx.x * Q_TILE;
+    const int h  = blockIdx.y;
+    const int b  = blockIdx.z;
+    const int d  = threadIdx.x;
+    if (h >= n_head || b >= n_batch || d >= D) {
+        return;
+    }
+
+    const int gqa = n_head / n_head_kv;
+    const int hk  = h / gqa;
+
+    const char * k_base = K + (int64_t)b*k_nb3 + (int64_t)hk*k_nb2;
+    const char * v_base = V + (int64_t)b*v_nb3 + (int64_t)hk*v_nb2;
+
+    float qd[Q_TILE];
+    float acc[Q_TILE];
+    float m[Q_TILE];
+    float ss[Q_TILE];
+    bool  q_ok[Q_TILE];
+
+#pragma unroll
+    for (int qi = 0; qi < Q_TILE; ++qi) {
+        const int q = q0 + qi;
+        q_ok[qi] = q < n_q;
+        if (q_ok[qi]) {
+            const char * q_row = Q + (int64_t)b*q_nb3 + (int64_t)h*q_nb2 + (int64_t)q*q_nb1;
+            qd[qi] = ((const float *)q_row)[d];
+        } else {
+            qd[qi] = 0.0f;
+        }
+        acc[qi] = 0.0f;
+        m[qi]   = -3.4028234663852886e38f;
+        ss[qi]  = 0.0f;
+    }
+
+    __shared__ float red[Q_TILE][D];
+    for (int k = 0; k < n_kv; ++k) {
+        const char * k_row = k_base + (int64_t)k*k_nb1;
+        const float kd = tree_q8_0_load_d128(k_row, d);
+
+#pragma unroll
+        for (int qi = 0; qi < Q_TILE; ++qi) {
+            red[qi][d] = qd[qi] * kd;
+        }
+        __syncthreads();
+
+        for (int stride = D/2; stride > 0; stride >>= 1) {
+            if (d < stride) {
+#pragma unroll
+                for (int qi = 0; qi < Q_TILE; ++qi) {
+                    red[qi][d] += red[qi][d + stride];
+                }
+            }
+            __syncthreads();
+        }
+
+        const char * v_row = v_base + (int64_t)k*v_nb1;
+        const float vd = tree_q8_0_load_d128(v_row, d);
+#pragma unroll
+        for (int qi = 0; qi < Q_TILE; ++qi) {
+            if (!q_ok[qi]) {
+                continue;
+            }
+            const int q = q0 + qi;
+            const char * m_row = mask + (int64_t)(b % n_batch)*m_nb3 + (int64_t)q*m_nb1;
+            const float mask_v = __half2float(((const half *)m_row)[k]);
+            if (mask_v <= -60000.0f) {
+                continue;
+            }
+
+            const float score = red[qi][0] * scale + mask_v;
+            const float m_new = fmaxf(m[qi], score);
+            const float old_scale = ss[qi] == 0.0f ? 0.0f : expf(m[qi] - m_new);
+            const float p = expf(score - m_new);
+            acc[qi] = acc[qi] * old_scale + p * vd;
+            ss[qi]  = ss[qi] * old_scale + p;
+            m[qi]   = m_new;
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int qi = 0; qi < Q_TILE; ++qi) {
+        const int q = q0 + qi;
+        if (q_ok[qi]) {
+            float * dst_row = (float *)(dst + (int64_t)b*d_nb3 + (int64_t)q*d_nb2 + (int64_t)h*d_nb1);
+            dst_row[d] = ss[qi] > 0.0f ? acc[qi] / ss[qi] : 0.0f;
+        }
+    }
+}
+
 static bool ggml_cuda_flash_attn_tree_q8_0_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -227,6 +346,79 @@ static void ggml_cuda_flash_attn_tree_q8_0(ggml_backend_cuda_context & ctx, ggml
         V->nb[1], V->nb[2], V->nb[3],
         M->nb[1], M->nb[3],
         dst->nb[1], dst->nb[2], dst->nb[3]);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static bool ggml_cuda_flash_attn_tree_q8_0_qtile_supported(const ggml_tensor * dst) {
+    if (!ggml_cuda_flash_attn_tree_q8_0_supported(dst)) {
+        return false;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    return Q->ne[3] == 1 && Q->ne[1] > 1;
+}
+
+static int ggml_cuda_flash_attn_tree_q8_0_qtile_size() {
+    int qtile = 4;
+    if (const char * env = std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_QTILE_SIZE")) {
+        const int v = std::atoi(env);
+        if (v == 2 || v == 4 || v == 8) {
+            qtile = v;
+        }
+    }
+    if (const char * env = std::getenv("GGML_CUDA_TREE_ATTN_Q8_QTILE_SIZE")) {
+        const int v = std::atoi(env);
+        if (v == 2 || v == 4 || v == 8) {
+            qtile = v;
+        }
+    }
+    return qtile;
+}
+
+static void ggml_cuda_flash_attn_tree_q8_0_qtile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+    GGML_ASSERT(ggml_cuda_flash_attn_tree_q8_0_qtile_supported(dst));
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * M = dst->src[3];
+
+    float op_params[2];
+    memcpy(op_params, dst->op_params, sizeof(op_params));
+    const float scale = op_params[0];
+
+    constexpr int block = 128;
+    const int qtile = ggml_cuda_flash_attn_tree_q8_0_qtile_size();
+    const unsigned n_qtiles = (unsigned)((Q->ne[1] + qtile - 1) / qtile);
+    const dim3 grid(n_qtiles, (unsigned)Q->ne[2], (unsigned)Q->ne[3]);
+
+#define DFLASH_LAUNCH_QTILE(QT)                                                     \
+    k_flash_attn_tree_q8_0_d128_qtile<QT><<<grid, block, 0, ctx.stream()>>>(         \
+        (const char *)Q->data,                                                       \
+        (const char *)K->data,                                                       \
+        (const char *)V->data,                                                       \
+        (const char *)M->data,                                                       \
+        (char *)dst->data,                                                           \
+        scale,                                                                       \
+        (int32_t)Q->ne[1],                                                           \
+        (int32_t)Q->ne[2],                                                           \
+        (int32_t)K->ne[2],                                                           \
+        (int32_t)K->ne[1],                                                           \
+        (int32_t)Q->ne[3],                                                           \
+        Q->nb[1], Q->nb[2], Q->nb[3],                                                \
+        K->nb[1], K->nb[2], K->nb[3],                                                \
+        V->nb[1], V->nb[2], V->nb[3],                                                \
+        M->nb[1], M->nb[3],                                                          \
+        dst->nb[1], dst->nb[2], dst->nb[3])
+
+    if (qtile == 8) {
+        DFLASH_LAUNCH_QTILE(8);
+    } else if (qtile == 2) {
+        DFLASH_LAUNCH_QTILE(2);
+    } else {
+        DFLASH_LAUNCH_QTILE(4);
+    }
+#undef DFLASH_LAUNCH_QTILE
+
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -479,6 +671,12 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
         std::getenv("GGML_CUDA_TREE_ATTN_Q8_DISABLE") == nullptr &&
         std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_DISABLE") == nullptr &&
         ggml_cuda_flash_attn_tree_q8_0_supported(dst);
+    const bool tree_q8_qtile_enabled = tree_mode &&
+        (std::getenv("GGML_CUDA_TREE_ATTN_Q8_QTILE") != nullptr ||
+         std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_QTILE") != nullptr) &&
+        std::getenv("GGML_CUDA_TREE_ATTN_Q8_QTILE_DISABLE") == nullptr &&
+        std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_QTILE_DISABLE") == nullptr &&
+        ggml_cuda_flash_attn_tree_q8_0_qtile_supported(dst);
     const bool tree_q8_parallel_enabled = tree_mode &&
         (std::getenv("GGML_CUDA_TREE_ATTN_Q8_PAR") != nullptr ||
          std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_PAR") != nullptr) &&
@@ -486,6 +684,10 @@ void ggml_cuda_flash_attn_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * 
         std::getenv("DFLASH_LAGUNA_TREE_ATTN_Q8_PAR_DISABLE") == nullptr &&
         ggml_cuda_flash_attn_tree_q8_0_parallel_supported(dst);
 
+    if (tree_q8_qtile_enabled) {
+        ggml_cuda_flash_attn_tree_q8_0_qtile(ctx, dst);
+        return;
+    }
     if (tree_q8_parallel_enabled) {
         ggml_cuda_flash_attn_tree_q8_0_parallel(ctx, dst);
         return;
