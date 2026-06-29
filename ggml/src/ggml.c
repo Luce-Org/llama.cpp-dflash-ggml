@@ -5421,6 +5421,37 @@ struct ggml_tensor * ggml_flash_attn_sparse(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_tree(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * parent_ids,
+        struct ggml_tensor  * positions,
+        float                 scale) {
+
+    GGML_ASSERT(parent_ids != NULL);
+    GGML_ASSERT(parent_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(positions != NULL);
+    GGML_ASSERT(positions->type == GGML_TYPE_I32);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+
+    struct ggml_tensor * result = ggml_flash_attn_sparse(
+        ctx, q, k, v, scale, /*alpha=*/-1.0f);
+    result->src[3] = mask;
+    result->src[4] = parent_ids;
+    result->src[5] = positions;
+
+    return result;
+}
+
 // ggml_flash_attn_back
 
 struct ggml_tensor * ggml_flash_attn_back(
