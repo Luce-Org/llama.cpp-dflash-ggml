@@ -2547,6 +2547,10 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    GGML_API void ggml_gated_delta_net_set_skip_intermediate(
+            struct ggml_tensor * tensor,
+            bool                 skip_intermediate);
+
     // dflash extension: tree-mode gated delta net for DDTree-style
     // speculative decoding verify. `parent_ids` is an int32 tensor of shape
     // [n_tokens, n_seqs] where entry [t, s] is the index within sequence s of
