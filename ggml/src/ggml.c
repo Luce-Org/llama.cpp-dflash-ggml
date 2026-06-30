@@ -6274,6 +6274,31 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+void ggml_gated_delta_net_set_skip_intermediate(
+        struct ggml_tensor * tensor,
+        bool                 skip_intermediate) {
+    GGML_ASSERT(tensor != NULL);
+    GGML_ASSERT(tensor->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(tensor, 0, skip_intermediate ? 1 : 0);
+
+    const struct ggml_tensor * v = tensor->src[2];
+    GGML_ASSERT(v != NULL);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    // Compact only the plain chain path. Tree/persistent variants need
+    // intermediate states for branch reloads or explicit capture storage.
+    const bool can_compact = tensor->src[6] == NULL && tensor->src[7] == NULL;
+    tensor->ne[1] = n_tokens*n_seqs + S_v*n_seqs;
+    if (!skip_intermediate || !can_compact) {
+        tensor->ne[1] += S_v*n_tokens*n_seqs;
+    }
+    tensor->nb[2] = tensor->nb[1]*tensor->ne[1];
+    tensor->nb[3] = tensor->nb[2]*tensor->ne[2];
+}
+
 // dflash: tree-mode variant. Same op, with parent_ids plumbed into
 // src[6] so the CUDA kernel can branch-reload state at DFS transitions.
 struct ggml_tensor * ggml_gated_delta_net_tree(
