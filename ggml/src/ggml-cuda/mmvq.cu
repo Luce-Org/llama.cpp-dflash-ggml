@@ -235,13 +235,24 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 
 // Host function: returns the max batch size for the current arch+type at runtime.
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+    // Dedicated multi-token MoE kernel: extend the MUL_MAT_ID ceiling to 16
+    // tokens on NVIDIA Turing+ for types whose base ceiling is already the
+    // maximum. Types with tuned lower ceilings (per PR 20905) keep them.
+    static const bool moe_kernel_enabled = []() {
+        const char * e = std::getenv("DFLASH_CUDA_MMVQ_MOE_KERNEL");
+        return !(e && e[0] == '0' && e[1] == '\0');
+    }();
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
-            return MMVQ_MAX_BATCH_SIZE;
+            return moe_kernel_enabled ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE;
         }
         if (cc >= GGML_CUDA_CC_TURING) {
-            return get_mmvq_mmid_max_batch_turing_plus(type);
+            const int base = get_mmvq_mmid_max_batch_turing_plus(type);
+            if (moe_kernel_enabled && base >= MMVQ_MAX_BATCH_SIZE) {
+                return MMVQ_MAX_MOE_BATCH_SIZE;
+            }
+            return base;
         }
         return get_mmvq_mmid_max_batch_pascal_older(type);
     }
@@ -281,9 +292,14 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 #elif defined(GCN)
     return get_mmvq_mmid_max_batch_gcn(type);
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == GGML_CUDA_CC_VOLTA || __CUDA_ARCH__ >= GGML_CUDA_CC_ADA_LOVELACE)
-    return MMVQ_MAX_BATCH_SIZE;
+    return MMVQ_MAX_MOE_BATCH_SIZE;
 #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING
-    return get_mmvq_mmid_max_batch_turing_plus(type);
+    // Mirror the host-side extension: full-cap types compile the MoE kernel
+    // for up to MMVQ_MAX_MOE_BATCH_SIZE tokens (launch_bounds); the host
+    // router decides at runtime whether to use the extended range.
+    return get_mmvq_mmid_max_batch_turing_plus(type) >= MMVQ_MAX_BATCH_SIZE
+        ? MMVQ_MAX_MOE_BATCH_SIZE
+        : get_mmvq_mmid_max_batch_turing_plus(type);
 #else
     return get_mmvq_mmid_max_batch_pascal_older(type);
 #endif
@@ -799,7 +815,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int ids_stride, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
-    GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(ncols_dst <= (ids ? MMVQ_MAX_MOE_BATCH_SIZE : MMVQ_MAX_BATCH_SIZE));
 
     const uint3 nchannels_y_fd   = ids ? init_fastdiv_values(nchannels_y) : make_uint3(0, 0, 0);
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0)              : init_fastdiv_values(nchannels_dst / nchannels_x);
@@ -918,7 +934,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
 
-    if (use_moe_kernel && has_ids && ncols_dst > 1) {
+    if (has_ids && ncols_dst > 1 && (use_moe_kernel || ncols_dst > MMVQ_MAX_BATCH_SIZE)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
@@ -1176,7 +1192,7 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
+    GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_MOE_BATCH_SIZE);
 
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
