@@ -1183,6 +1183,8 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // GGML_CUDA_GRAPH_STATS=1 counters
+    uint64_t stat_total = 0, stat_replay = 0, stat_capture = 0, stat_eager = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1353,6 +1355,19 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+
+    // LUCE_Q8_MEMO=1: memoize q8_1-quantized src1 activations across the
+    // quantized matmuls of ONE graph evaluation (Q/K/V/gate/router/shexp all
+    // re-quantize the same hidden state otherwise). Entries are freed in LIFO
+    // order at the start of the next evaluation to keep the pool discipline.
+    struct luce_q8_memo_entry {
+        const void * src1_node   = nullptr;  // ggml_tensor identity within the eval
+        const void * src1_data   = nullptr;
+        int          src0_type   = 0;
+        int64_t      ne[4]       = {0, 0, 0, 0};
+        std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+    };
+    std::vector<luce_q8_memo_entry> luce_q8_memo;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES] = {nullptr};

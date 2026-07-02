@@ -2469,9 +2469,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_f     = !ggml_is_quantized(src0->type)
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
+    // LUCE_MMVQ_MAX_NCOLS: lower the MMVQ ncols ceiling for plain mul_mat so
+    // that MMQ takes small multi-token batches (spec-decode verify widths).
+    static const int luce_mmvq_max_ncols = []() {
+        const char * e = getenv("LUCE_MMVQ_MAX_NCOLS");
+        const int v = e ? atoi(e) : MMVQ_MAX_BATCH_SIZE;
+        return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
+    }();
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        && src1->ne[1] <= luce_mmvq_max_ncols;
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
@@ -3041,7 +3048,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        GGML_LOG_ERROR("%s: %s failed\n", __func__, ggml_op_desc(dst));
+        GGML_LOG_ERROR("%s: %s failed: node='%s' [%ld,%ld] src0='%s' t=%d [%ld,%ld] src1='%s' [%ld,%ld]\n",
+            __func__, ggml_op_desc(dst), dst->name, (long)dst->ne[0], (long)dst->ne[1],
+            dst->src[0] ? dst->src[0]->name : "-", dst->src[0] ? (int)dst->src[0]->type : -1,
+            dst->src[0] ? (long)dst->src[0]->ne[0] : 0, dst->src[0] ? (long)dst->src[0]->ne[1] : 0,
+            dst->src[1] ? dst->src[1]->name : "-",
+            dst->src[1] ? (long)dst->src[1]->ne[0] : 0, dst->src[1] ? (long)dst->src[1]->ne[1] : 0);
         CUDA_CHECK(err);
     }
 
@@ -4264,6 +4276,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // LIFO-free last evaluation's memoized q8_1 activations.
+    while (!cuda_ctx->luce_q8_memo.empty()) {
+        cuda_ctx->luce_q8_memo.pop_back();
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
@@ -4298,6 +4315,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
                 }
+            }
+        }
+    }
+#endif // USE_CUDA_GRAPH
+
+#ifdef USE_CUDA_GRAPH
+    {
+        static const bool luce_graph_stats = getenv("GGML_CUDA_GRAPH_STATS") != nullptr;
+        if (luce_graph_stats && graph_key) {
+            ggml_cuda_graph * g = cuda_ctx->cuda_graph(graph_key);
+            g->stat_total++;
+            if (use_cuda_graph && !cuda_graph_update_required) g->stat_replay++;
+            else if (use_cuda_graph) g->stat_capture++;
+            else g->stat_eager++;
+            if (g->stat_total % 200 == 0) {
+                GGML_LOG_INFO("[cuda-graph-stats] key=%p n_nodes=%d total=%llu replay=%llu capture=%llu eager=%llu enabled=%d\n",
+                    graph_key, cgraph->n_nodes,
+                    (unsigned long long)g->stat_total, (unsigned long long)g->stat_replay,
+                    (unsigned long long)g->stat_capture, (unsigned long long)g->stat_eager,
+                    (int)g->is_enabled());
             }
         }
     }
