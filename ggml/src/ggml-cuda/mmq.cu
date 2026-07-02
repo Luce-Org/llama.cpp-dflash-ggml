@@ -121,8 +121,18 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
+    bool use_stream_k = (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA)
                             || GGML_CUDA_CC_IS_CDNA(cc);
+    // LUCE_MMQ_DP_MAX_NE1: for ne1 at or below this, skip stream-k and use
+    // data-parallel tiles - the stream-k fixup pass costs ~1ms/step at
+    // spec-decode verify widths (measured sm_86, w6 chain). 0 = always stream-k.
+    static const int luce_mmq_dp_max_ne1 = []() {
+        const char * e = getenv("LUCE_MMQ_DP_MAX_NE1");
+        return e ? atoi(e) : 0;
+    }();
+    if (use_stream_k && ne11 <= luce_mmq_dp_max_ne1) {
+        use_stream_k = false;
+    }
 
     // TODO: tighter pool buffer size vs q8 path
     const bool use_native_mxfp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
