@@ -3937,6 +3937,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
 
+                    if (node->op == GGML_OP_SET_ROWS) {
+                        // Per-layer K/V cache appends arrive as two independent
+                        // quantized SET_ROWS, usually separated only by the
+                        // elidable view that feeds the second one. Fuse the pair
+                        // into a single launch (bit-identical per element).
+                        int j = i + 1;
+                        if (j < cgraph->n_nodes &&
+                            (cgraph->nodes[j]->op == GGML_OP_VIEW ||
+                             cgraph->nodes[j]->op == GGML_OP_RESHAPE ||
+                             cgraph->nodes[j]->op == GGML_OP_PERMUTE)) {
+                            j++;
+                        }
+                        if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_SET_ROWS) {
+                            ggml_tensor * other = cgraph->nodes[j];
+                            const bool independent =
+                                other->src[0] != node && other->src[1] != node &&
+                                (other->src[0]->view_src == nullptr || other->src[0]->view_src != node);
+                            if (independent && ggml_cuda_set_rows_dual_supported(node, other)) {
+                                ggml_cuda_op_set_rows_dual(*cuda_ctx, node, other);
+                                i = j;
+                                continue;
+                            }
+                        }
+                    }
+
                     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
                         int n_fuse = 0;
                         ggml_op ops[8];
