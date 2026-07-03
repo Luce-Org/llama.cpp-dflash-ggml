@@ -3208,7 +3208,16 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+            // Mirror ggml_cuda_mul_mat_id: the MMVQ and MMQ mul_mat_id paths
+            // are stream-sync-free and safe to capture; only the sort-based
+            // fallback requires a stream synchronize.
+            const bool mmid_mmvq_ok = ggml_is_quantized(node->src[0]->type) &&
+                node->ne[2] <= MMVQ_MAX_MOE_BATCH_SIZE &&
+                node->ne[2] <= mmvq_mmid_max;
+            const bool mmid_mmq_ok = ggml_is_quantized(node->src[0]->type) &&
+                ggml_cuda_should_use_mmq(node->src[0]->type, cc,
+                                         node->src[1]->ne[2], node->src[0]->ne[2]);
+            if (!mmid_mmvq_ok && !mmid_mmq_ok) {
                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
                 // TODO: figure out a way to enable for larger batch sizes, without hurting performance
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
