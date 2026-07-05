@@ -184,10 +184,64 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
+        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
+
+    const int64_t ne11_flat = ne12*n_expert_used;
+    const int64_t ne12_flat = 1;
+    const int64_t ne13_flat = 1;
+
+    // LUCE_MMQ_Q8_MEMO: dedup the src1->q8_1 requantization across MUL_MAT_ID calls
+    // sharing (src1, ids, src0 type, dims) within one eval -- MoE gate_e and up_e
+    // quantize the byte-identical gathered activation. Reuses the ctx.luce_q8_memo
+    // vector (freed LIFO at graph_compute start). Two invariants:
+    //  * keyed on the tensor NODES (src1/ids), since data ptrs alias across layers;
+    //  * mmq=true so an MMQ (block_q8_1_mmq) buffer never cross-reuses an mmvq q8_1 one.
+    // The q8 buffer is allocated HERE, BEFORE the transient id buffers, so those sit
+    // above it on the strict-LIFO pool and free first (a held memo buffer must never
+    // sit above a buffer that frees before it).
+    static const bool luce_mmq_q8_memo_on = []() {
+        const char * e = getenv("LUCE_MMQ_Q8_MEMO");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());  // owns the buffer on the non-memo path
+    char * src1_q8_1_ptr = nullptr;
+    bool   need_quantize = false;
+
+    if (luce_mmq_q8_memo_on) {
+        for (const auto & e : ctx.luce_q8_memo) {
+            if (e.mmq && e.src1_node == (const void *) src1 && e.ids_node == (const void *) ids &&
+                e.src1_data == (const void *) src1_d && e.ids_data == (const void *) ids->data &&
+                e.src0_type == (int) src0->type && e.ne[0] == ne10 && e.ne[1] == ne11_flat) {
+                src1_q8_1_ptr = e.buf->get();
+                break;
+            }
+        }
+    }
+    if (src1_q8_1_ptr == nullptr) {
+        need_quantize = true;
+        if (luce_mmq_q8_memo_on) {
+            ggml_backend_cuda_context::luce_q8_memo_entry ent;
+            ent.src1_node = (const void *) src1;
+            ent.src1_data = (const void *) src1_d;
+            ent.ids_node  = (const void *) ids;
+            ent.ids_data  = (const void *) ids->data;
+            ent.src0_type = (int) src0->type;
+            ent.ne[0] = ne10; ent.ne[1] = ne11_flat;
+            ent.mmq = true;
+            ent.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), nbytes_src1_q8_1);
+            src1_q8_1_ptr = ent.buf->get();
+            ctx.luce_q8_memo.push_back(std::move(ent));
+        } else {
+            src1_q8_1_local.alloc(nbytes_src1_q8_1);
+            src1_q8_1_ptr = src1_q8_1_local.get();
+        }
+    }
+
+    // Transient id buffers (allocated AFTER the q8 buffer -> above it on the pool).
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     // Pad ids_dst by mmq_x to prevent OOB reads in the stream-k kernel.
-    // The kernel loads a full mmq_x-wide tile from ids_dst (line 3709 in mmq.cuh)
-    // without bounds-checking the load, only the write-back is bounded.
     const int64_t mmq_x_pad = (int64_t)get_mmq_x_max_host(cc);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + mmq_x_pad);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
@@ -202,24 +256,16 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
-        get_mmq_x_max_host(cc)*sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
-
-    const int64_t ne11_flat = ne12*n_expert_used;
-    const int64_t ne12_flat = 1;
-    const int64_t ne13_flat = 1;
-
-    {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
+    if (need_quantize) {
+        const int64_t s11  = src1->nb[1] / ts_src1;
+        const int64_t s12q = src1->nb[2] / ts_src1;
+        const int64_t s13q = src1->nb[3] / ts_src1;
 
         if (use_native_mxfp4) {
-            quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_mxfp4_cuda(src1_d, ids_src1.get(), src1_q8_1_ptr, src0->type, ne10, s11, s12q, s13q,
                                     ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1_ptr, src0->type, ne10, s11, s12q, s13q,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -231,7 +277,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1_ptr, ids_dst.get(), expert_bounds.get(), dst_d,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,

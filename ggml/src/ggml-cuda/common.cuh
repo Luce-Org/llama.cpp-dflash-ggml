@@ -1363,8 +1363,11 @@ struct ggml_backend_cuda_context {
     struct luce_q8_memo_entry {
         const void * src1_node   = nullptr;  // ggml_tensor identity within the eval
         const void * src1_data   = nullptr;
+        const void * ids_node    = nullptr;  // MMQ MUL_MAT_ID only (mmvq leaves null)
+        const void * ids_data    = nullptr;
         int          src0_type   = 0;
         int64_t      ne[4]       = {0, 0, 0, 0};
+        bool         mmq         = false;    // MMQ (block_q8_1_mmq layout) vs mmvq q8_1 -- never cross-reuse
         std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
     };
     std::vector<luce_q8_memo_entry> luce_q8_memo;
