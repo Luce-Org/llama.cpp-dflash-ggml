@@ -220,10 +220,25 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         }                                                                                                        \
     }                                                                                                            \
 
+#define FATTN_VEC_MASKED_CASE(D, type_K, type_V)                                                                \
+    {                                                                                                           \
+        const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16);\
+        const bool type_V_okay = V->type == (type_V) || (V->type == GGML_TYPE_F32 && (type_V) == GGML_TYPE_F16);\
+        if (Q->ne[0] == (D) && type_K_okay && type_V_okay) {                                                    \
+            ggml_cuda_flash_attn_ext_vec_masked_case<D, type_K, type_V>(ctx, dst);                              \
+            return;                                                                                             \
+        }                                                                                                       \
+    }                                                                                                           \
+
 #define FATTN_VEC_CASES_ALL_D(type_K, type_V) \
     FATTN_VEC_CASE( 64, type_K, type_V)       \
     FATTN_VEC_CASE(128, type_K, type_V)       \
     FATTN_VEC_CASE(256, type_K, type_V)       \
+
+#define FATTN_VEC_MASKED_CASES_ALL_D(type_K, type_V) \
+    FATTN_VEC_MASKED_CASE( 64, type_K, type_V)       \
+    FATTN_VEC_MASKED_CASE(128, type_K, type_V)       \
+    FATTN_VEC_MASKED_CASE(256, type_K, type_V)       \
 
 static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_tensor * Q = dst->src[0];
@@ -310,6 +325,82 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
+}
+
+static void ggml_cuda_flash_attn_ext_vec_masked(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+
+    FATTN_VEC_MASKED_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
+
+    GGML_ABORT("fatal error");
+}
+
+static bool ggml_cuda_flash_attn_ext_vec_kv_type_supported(const ggml_tensor * K, const ggml_tensor * V) {
+    if (K->type != V->type) {
+        return false;
+    }
+
+    switch (K->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_BF16:
+            return true;
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+            return true;
+#endif // GGML_CUDA_FA_ALL_QUANTS
+#ifndef GGML_USE_HIP
+        case GGML_TYPE_TQ3_0:
+            return true;
+#endif // GGML_USE_HIP
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_flash_attn_ext_vec_supported(const ggml_tensor * dst) {
+#ifndef FLASH_ATTN_AVAILABLE
+    GGML_UNUSED(dst);
+    return false;
+#else
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (!Q || !K || !V || Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (Q->ne[2] % K->ne[2] != 0 || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+    if (mask && mask->ne[2] != 1) {
+        return false;
+    }
+    if (!(Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) || V->ne[0] != K->ne[0]) {
+        return false;
+    }
+    return ggml_cuda_flash_attn_ext_vec_kv_type_supported(K, V);
+#endif // FLASH_ATTN_AVAILABLE
+}
+
+void ggml_cuda_flash_attn_ext_vec_force(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_vec_supported(dst));
+    ggml_cuda_flash_attn_ext_vec(ctx, dst);
+}
+
+void ggml_cuda_flash_attn_ext_vec_masked_force(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_cuda_set_device(ctx.device);
+    GGML_ASSERT(ggml_cuda_flash_attn_ext_vec_supported(dst));
+    GGML_ASSERT(dst->src[3] != nullptr);
+    ggml_cuda_flash_attn_ext_vec_masked(ctx, dst);
 }
 
 // Best FlashAttention kernel for a specific GPU:
@@ -466,6 +557,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    static const bool force_tile_kernel =
+        (std::getenv("GGML_CUDA_FA_FORCE_TILE") != nullptr ||
+         std::getenv("DFLASH_LAGUNA_FA_FORCE_TILE") != nullptr) &&
+        std::getenv("GGML_CUDA_FA_FORCE_TILE_DISABLE") == nullptr &&
+        std::getenv("DFLASH_LAGUNA_FA_FORCE_TILE_DISABLE") == nullptr;
+    if (force_tile_kernel) {
+        return BEST_FATTN_KERNEL_TILE;
+    }
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
         if (can_use_vector_kernel) {

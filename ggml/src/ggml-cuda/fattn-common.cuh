@@ -5,6 +5,7 @@
 #include "vecdotq.cuh"
 #include "tq3-quant.cuh"
 
+#include <cstdlib>
 #include <cstdint>
 
 #define FATTN_KQ_STRIDE       256
@@ -26,6 +27,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_min,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -766,6 +768,54 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+template <int ncols1>
+__launch_bounds__(FATTN_KQ_STRIDE/2, 1)
+static __global__ void flash_attn_mask_to_KV_min(
+        const half2 * __restrict__ mask, int * __restrict__ KV_min, const int ne30, const int s31, const int s33) {
+    const int ne31     = gridDim.x;
+    const int tid      = threadIdx.x;
+    const int sequence = blockIdx.y;
+    const int jt       = blockIdx.x;
+
+    mask += sequence*s33 + jt*ncols1*s31;
+
+    __shared__ int buf_iw[WARP_SIZE];
+    if (tid < WARP_SIZE) {
+        buf_iw[tid] = 1;
+    }
+    __syncthreads();
+
+    int KV_min_sj = 0;
+    for (; KV_min_sj < ne30 * FATTN_KQ_STRIDE; KV_min_sj += FATTN_KQ_STRIDE) {
+        int all_inf = 1;
+
+#pragma unroll
+        for (int j = 0; j < ncols1; ++j) {
+            const float2 tmp = __half22float2(mask[j*s31 + KV_min_sj/2 + tid]);
+            all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
+        }
+
+        all_inf = warp_reduce_all(all_inf);
+        if (tid % WARP_SIZE == 0) {
+            buf_iw[tid / WARP_SIZE] = all_inf;
+        }
+        __syncthreads();
+        all_inf = buf_iw[tid % WARP_SIZE];
+        __syncthreads();
+        all_inf = warp_reduce_all(all_inf);
+
+        if (!all_inf) {
+            break;
+        }
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    KV_min[sequence*ne31 + jt] = KV_min_sj;
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1041,6 +1091,7 @@ void launch_fattn(
     ggml_cuda_pool_alloc<half>   K_f16(pool);
     ggml_cuda_pool_alloc<half>   V_f16(pool);
     ggml_cuda_pool_alloc<int>    KV_max(pool);
+    ggml_cuda_pool_alloc<int>    KV_min(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
 
@@ -1121,10 +1172,18 @@ void launch_fattn(
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
 
+    static const bool kv_min_enabled =
+        (std::getenv("GGML_CUDA_FA_KV_MIN") != nullptr ||
+         std::getenv("DFLASH_LAGUNA_FA_KV_MIN") != nullptr) &&
+        std::getenv("GGML_CUDA_FA_KV_MIN_DISABLE") == nullptr &&
+        std::getenv("DFLASH_LAGUNA_FA_KV_MIN_DISABLE") == nullptr;
+
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
-    // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
-    //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // KV_max skips trailing all-masked tiles. KV_min, when explicitly enabled, skips leading all-masked tiles.
+    // Both bounds are conservative at FATTN_KQ_STRIDE granularity; the mask remains authoritative.
+    const bool can_scan_kv_bounds = mask && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool kv_max_enabled = can_scan_kv_bounds && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if (can_scan_kv_bounds && (kv_max_enabled || kv_min_enabled)) {
         const int s31 = mask->nb[1] / sizeof(half2);
         const int s33 = mask->nb[3] / sizeof(half2);
 
@@ -1134,10 +1193,18 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
-        flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
-            ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
-        CUDA_CHECK(cudaGetLastError());
+        if (kv_max_enabled) {
+            KV_max.alloc(ne_KV_max);
+            flash_attn_mask_to_KV_max<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
+                ((const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        if (kv_min_enabled) {
+            KV_min.alloc(ne_KV_max);
+            flash_attn_mask_to_KV_min<ncols1><<<blocks_num_KV_max, block_dim_KV_max, 0, main_stream>>>
+                ((const half2 *) mask->data, KV_min.ptr, iter_k, s31, s33);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
@@ -1245,6 +1312,7 @@ void launch_fattn(
         mask ? ((const char *) mask->data) : nullptr,
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
+        KV_min.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],

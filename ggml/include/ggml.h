@@ -2370,6 +2370,19 @@ extern "C" {
             float                 scale,
             float                 alpha);
 
+    // DDTree/tree-causal flash attention carrier. Uses FLASH_ATTN_SPARSE with
+    // extra sources so CUDA/HIP backends can specialize; dense masked FA fallback
+    // remains exact when no tree kernel is available.
+    GGML_API struct ggml_tensor * ggml_flash_attn_tree(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * parent_ids,
+            struct ggml_tensor  * positions,
+            float                 scale);
+
     // TurboQuant FWHT rotation. direction: 0 = forward, 1 = inverse.
     // Applies signs1 -> FWHT -> signs2 (forward) or signs2 -> FWHT -> signs1 (inverse).
     // Used for KV cache rotation in TurboQuant quantization types (TQ3_0).
