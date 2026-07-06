@@ -430,7 +430,13 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_TQ3_0   = 42,  // TurboQuant 3.5 bpv (3-bit Lloyd-Max + FWHT rotation)
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q4_0_ROCMFP4      = 100,
+        GGML_TYPE_Q4_0_ROCMFP4_FAST = 101,
+        GGML_TYPE_Q6_0_ROCMFPX      = 102,
+        GGML_TYPE_Q8_0_ROCMFPX      = 103,
+        GGML_TYPE_Q3_0_ROCMFPX      = 104,
+        GGML_TYPE_Q2_0_ROCMFP2      = 107,
+        GGML_TYPE_COUNT   = 108,
     };
 
     // precision
@@ -468,6 +474,18 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4          = 100,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_LEAN     = 101,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_COHERENT = 102,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST     = 103,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_FAST_COHERENT = 104,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX    = 105,
+        GGML_FTYPE_MOSTLY_Q4_0_ROCMFP4_STRIX_LEAN = 106,
+        GGML_FTYPE_MOSTLY_Q6_0_ROCMFPX          = 110,
+        GGML_FTYPE_MOSTLY_Q8_0_ROCMFPX          = 111,
+        GGML_FTYPE_MOSTLY_Q3_0_ROCMFPX          = 112,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2          = 118,
+        GGML_FTYPE_MOSTLY_Q2_0_ROCMFP2_STRIX    = 119,
     };
 
     // available tensor operations:
@@ -618,6 +636,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU,
         GGML_GLU_OP_SWIGLU,
         GGML_GLU_OP_SWIGLU_OAI,
+        GGML_GLU_OP_SWIGLU_DS4,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
 
@@ -1338,6 +1357,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_swiglu_ds4_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * up,
+            float                 clamp);
 
     GGML_API struct ggml_tensor * ggml_geglu_erf_split(
             struct ggml_context * ctx,

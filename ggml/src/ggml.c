@@ -9,6 +9,8 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "../rocmfp4/rocmfp4.h"
+#include "../rocmfpx/rocmfpx.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -719,6 +721,54 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q8_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q8_0_ref,
     },
+    [GGML_TYPE_Q4_0_ROCMFP4] = {
+        .type_name                = "q4_0_rocmfp4",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_ref,
+    },
+    [GGML_TYPE_Q4_0_ROCMFP4_FAST] = {
+        .type_name                = "q4_0_rocmfp4_fast",
+        .blck_size                = QK_ROCMFP4,
+        .type_size                = sizeof(block_rocmfp4_fast),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfp4_dequantize_row_q4_0_fast,
+        .from_float_ref           = (ggml_from_float_t) rocmfp4_quantize_row_q4_0_fast_ref,
+    },
+    [GGML_TYPE_Q3_0_ROCMFPX] = {
+        .type_name                = "q3_0_rocmfpx",
+        .blck_size                = QK_ROCMFP3,
+        .type_size                = sizeof(block_rocmfp3),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp3,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp3_ref,
+    },
+    [GGML_TYPE_Q2_0_ROCMFP2] = {
+        .type_name                = "q2_0_rocmfp2",
+        .blck_size                = QK_ROCMFP2,
+        .type_size                = sizeof(block_rocmfp2),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp2,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp2_ref,
+    },
+    [GGML_TYPE_Q6_0_ROCMFPX] = {
+        .type_name                = "q6_0_rocmfpx",
+        .blck_size                = QK_ROCMFP6,
+        .type_size                = sizeof(block_rocmfp6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp6,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp6_ref,
+    },
+    [GGML_TYPE_Q8_0_ROCMFPX] = {
+        .type_name                = "q8_0_rocmfpx",
+        .blck_size                = QK_ROCMFP8,
+        .type_size                = sizeof(block_rocmfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) rocmfpx_dequantize_row_fp8,
+        .from_float_ref           = (ggml_from_float_t) rocmfpx_quantize_row_fp8_ref,
+    },
     [GGML_TYPE_Q8_1] = {
         .type_name                = "q8_1",
         .blck_size                = QK8_1,
@@ -1225,11 +1275,12 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU",
     "SWIGLU",
     "SWIGLU_OAI",
+    "SWIGLU_DS4",
     "GEGLU_ERF",
     "GEGLU_QUICK",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
+static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3023,6 +3074,16 @@ struct ggml_tensor * ggml_swiglu_split(
         struct ggml_tensor  * a,
         struct ggml_tensor  * b) {
     return ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SWIGLU, false);
+}
+
+struct ggml_tensor * ggml_swiglu_ds4_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * up,
+        float                 clamp) {
+    struct ggml_tensor * result = ggml_glu_impl(ctx, gate, up, GGML_GLU_OP_SWIGLU_DS4, false);
+    ggml_set_op_params_f32(result, 2, clamp);
+    return result;
 }
 
 // ggml_geglu_erf
