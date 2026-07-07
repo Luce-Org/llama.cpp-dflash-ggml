@@ -117,5 +117,6 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_ds4_single(float gate, floa
     gate = fminf(gate, limit);
     up   = fmaxf(fminf(up, limit), -limit);
 
-    return up * gate / (1.0f + expf(-gate));
+    const float silu = gate / (1.0f + expf(-gate));
+    return silu * up;
 }
