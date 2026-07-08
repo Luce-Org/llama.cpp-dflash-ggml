@@ -93,6 +93,131 @@ static __device__ void ds4_hc_sinkhorn_split(
     }
 }
 
+// Fully-unrolled variant: with compile-time NHC the c[] matrix lives in
+// registers. The generic version's runtime-bound loops force c[] into scratch
+// (private, VRAM-backed) memory, making the serial sinkhorn ~20x slower
+// (97us vs 5us measured on gfx1151).
+template<int NHC>
+static __device__ void ds4_hc_sinkhorn_split_t(
+        const float * mix,
+        const float * base,
+        float         pre_scale,
+        float         post_scale,
+        float         comb_scale,
+        int           iters,
+        float       * split) {
+    #pragma unroll
+    for (int i = 0; i < NHC; ++i) {
+        split[i] = ds4_hc_sigmoid(mix[i] * pre_scale + base[i]) + DS4_HC_SINKHORN_EPS;
+    }
+    #pragma unroll
+    for (int i = 0; i < NHC; ++i) {
+        split[NHC + i] = 2.0f * ds4_hc_sigmoid(mix[NHC + i] * post_scale + base[NHC + i]);
+    }
+    float c[NHC * NHC];
+    #pragma unroll
+    for (int dst_i = 0; dst_i < NHC; ++dst_i) {
+        float row_max = -1.0e30f;
+        #pragma unroll
+        for (int src_i = 0; src_i < NHC; ++src_i) {
+            const int idx = src_i + dst_i * NHC;
+            const float v = mix[2 * NHC + idx] * comb_scale + base[2 * NHC + idx];
+            c[idx] = v;
+            row_max = v > row_max ? v : row_max;
+        }
+        float row_sum = 0.0f;
+        #pragma unroll
+        for (int src_i = 0; src_i < NHC; ++src_i) {
+            const int idx = src_i + dst_i * NHC;
+            c[idx] = expf(c[idx] - row_max);
+            row_sum += c[idx];
+        }
+        const float inv = 1.0f / row_sum;
+        #pragma unroll
+        for (int src_i = 0; src_i < NHC; ++src_i) {
+            c[src_i + dst_i * NHC] = c[src_i + dst_i * NHC] * inv + DS4_HC_SINKHORN_EPS;
+        }
+    }
+    #pragma unroll
+    for (int src_i = 0; src_i < NHC; ++src_i) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int dst_i = 0; dst_i < NHC; ++dst_i) sum += c[src_i + dst_i * NHC];
+        const float inv = 1.0f / (sum + DS4_HC_SINKHORN_EPS);
+        #pragma unroll
+        for (int dst_i = 0; dst_i < NHC; ++dst_i) c[src_i + dst_i * NHC] *= inv;
+    }
+    for (int iter = 1; iter < iters; ++iter) {
+        #pragma unroll
+        for (int dst_i = 0; dst_i < NHC; ++dst_i) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int src_i = 0; src_i < NHC; ++src_i) sum += c[src_i + dst_i * NHC];
+            const float inv = 1.0f / (sum + DS4_HC_SINKHORN_EPS);
+            #pragma unroll
+            for (int src_i = 0; src_i < NHC; ++src_i) c[src_i + dst_i * NHC] *= inv;
+        }
+        #pragma unroll
+        for (int src_i = 0; src_i < NHC; ++src_i) {
+            float sum = 0.0f;
+            #pragma unroll
+            for (int dst_i = 0; dst_i < NHC; ++dst_i) sum += c[src_i + dst_i * NHC];
+            const float inv = 1.0f / (sum + DS4_HC_SINKHORN_EPS);
+            #pragma unroll
+            for (int dst_i = 0; dst_i < NHC; ++dst_i) c[src_i + dst_i * NHC] *= inv;
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < NHC * NHC; ++i) {
+        split[2 * NHC + i] = c[i];
+    }
+}
+
+template<int NHC>
+static __global__ void ds4_hc_pre_kernel_t(
+        const float * __restrict__ mix,
+        const float * __restrict__ base,
+        const float * __restrict__ hc_state,
+        float       * __restrict__ dst,
+        int   n_embd,
+        int   iters,
+        float pre_scale,
+        float post_scale,
+        float comb_scale) {
+    __shared__ float split[DS4_HC_MAX_MIX];
+    __shared__ float s_mix[DS4_HC_MAX_MIX];
+    __shared__ float s_base[DS4_HC_MAX_MIX];
+    constexpr int mix_dim = 2 * NHC + NHC * NHC;
+    const int tid = threadIdx.x;
+
+    if (tid < mix_dim) {
+        s_mix[tid]  = mix[tid];
+        s_base[tid] = base[tid];
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        ds4_hc_sinkhorn_split_t<NHC>(s_mix, s_base, pre_scale, post_scale, comb_scale, iters, split);
+        if (blockIdx.x == 0) {
+            #pragma unroll
+            for (int i = 0; i < mix_dim; ++i) {
+                dst[n_embd + i] = split[i];
+            }
+        }
+    }
+    __syncthreads();
+
+    const int d = (int) blockIdx.x * blockDim.x + tid;
+    if (d < n_embd) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (int h = 0; h < NHC; ++h) {
+            acc += split[h] * hc_state[(size_t) h * n_embd + d];
+        }
+        dst[d] = acc;
+    }
+}
+
 static __global__ void ds4_hc_pre_kernel(
         const float * __restrict__ mix,
         const float * __restrict__ base,
@@ -105,18 +230,33 @@ static __global__ void ds4_hc_pre_kernel(
         float post_scale,
         float comb_scale) {
     __shared__ float split[DS4_HC_MAX_MIX];
+    __shared__ float s_mix[DS4_HC_MAX_MIX];
+    __shared__ float s_base[DS4_HC_MAX_MIX];
     const int mix_dim = 2 * n_hc + n_hc * n_hc;
     const int tid = threadIdx.x;
 
+    // Stage mix/base cooperatively: base lives in managed (UMA) memory where
+    // serial scalar loads cost ~2us each; one parallel coalesced load instead.
+    if (tid < mix_dim) {
+        s_mix[tid]  = mix[tid];
+        s_base[tid] = base[tid];
+    }
+    __syncthreads();
+
+    // Each block redoes the (tiny) sinkhorn into shared memory so the mix
+    // loop below can spread across the whole GPU instead of one CU.
     if (tid == 0) {
-        ds4_hc_sinkhorn_split(mix, base, pre_scale, post_scale, comb_scale, n_hc, iters, split);
-        for (int i = 0; i < mix_dim; ++i) {
-            dst[n_embd + i] = split[i];
+        ds4_hc_sinkhorn_split(s_mix, s_base, pre_scale, post_scale, comb_scale, n_hc, iters, split);
+        if (blockIdx.x == 0) {
+            for (int i = 0; i < mix_dim; ++i) {
+                dst[n_embd + i] = split[i];
+            }
         }
     }
     __syncthreads();
 
-    for (int d = tid; d < n_embd; d += blockDim.x) {
+    const int d = (int) blockIdx.x * blockDim.x + tid;
+    if (d < n_embd) {
         float acc = 0.0f;
         for (int h = 0; h < n_hc; ++h) {
             acc += split[h] * hc_state[(size_t) h * n_embd + d];
@@ -192,10 +332,18 @@ void ggml_cuda_op_ds4_hc(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             const float pre_scale  = ggml_get_op_params_f32(dst, 4);
             const float post_scale = ggml_get_op_params_f32(dst, 5);
             const float comb_scale = ggml_get_op_params_f32(dst, 6);
-            ds4_hc_pre_kernel<<<1, 256, 0, stream>>>(
-                (const float *) src0->data, (const float *) src1->data,
-                (const float *) src2->data, (float *) dst->data,
-                n_embd, n_hc, iters, pre_scale, post_scale, comb_scale);
+            const int pre_blocks = (n_embd + 255) / 256;
+            if (n_hc == 4) {
+                ds4_hc_pre_kernel_t<4><<<pre_blocks, 256, 0, stream>>>(
+                    (const float *) src0->data, (const float *) src1->data,
+                    (const float *) src2->data, (float *) dst->data,
+                    n_embd, iters, pre_scale, post_scale, comb_scale);
+            } else {
+                ds4_hc_pre_kernel<<<pre_blocks, 256, 0, stream>>>(
+                    (const float *) src0->data, (const float *) src1->data,
+                    (const float *) src2->data, (float *) dst->data,
+                    n_embd, n_hc, iters, pre_scale, post_scale, comb_scale);
+            }
         } break;
         case 1: {
             const int total = n_embd * n_hc;
