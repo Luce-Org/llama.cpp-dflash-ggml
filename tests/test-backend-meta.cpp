@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
 
 #include <cassert>
 #include <cmath>
@@ -123,6 +124,15 @@ int main() {
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     CHECK(buffer);
+    ggml_tensor * repeated_0 = ggml_backend_meta_simple_tensor(repeated, 0);
+    ggml_tensor * repeated_1 = ggml_backend_meta_simple_tensor(repeated, 1);
+    CHECK(repeated_0);
+    CHECK(repeated_1);
+    CHECK(repeated_0 != repeated_1);
+    CHECK(ggml_backend_meta_simple_tensor(repeated, 2) == nullptr);
+    CHECK(ggml_backend_meta_simple_tensor(nullptr, 0) == nullptr);
+    CHECK(ggml_nelements(repeated_0) + ggml_nelements(repeated_1) ==
+          ggml_nelements(repeated));
 
     std::vector<float> input((size_t) ggml_nelements(repeated));
     for (size_t i = 0; i < input.size(); ++i) input[i] = (float) i + 0.25f;
@@ -235,6 +245,8 @@ int main() {
         ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     CHECK(graph_alloc);
     CHECK(ggml_gallocr_alloc_graph(graph_alloc, graph));
+    CHECK(ggml_backend_meta_simple_tensor(mat_output, 0));
+    CHECK(ggml_backend_meta_simple_tensor(mat_output, 1));
 
     std::vector<float> column_data((size_t) ggml_nelements(column_weight));
     std::vector<float> row_data((size_t) ggml_nelements(row_weight));
