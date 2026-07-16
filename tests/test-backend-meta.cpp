@@ -32,6 +32,17 @@ static ggml_backend_meta_split_state split_state(
         state.n_segments = 1;
         return state;
     }
+    if (std::strcmp(tensor->name, "multi_repeat") == 0) {
+        state.axis = GGML_BACKEND_SPLIT_AXIS_0;
+        state.ne[0] = 2;
+        state.ne[1] = 2;
+        state.ne[2] = 4;
+        state.ne[3] = 4;
+        state.nr[0] = 2;
+        state.nr[1] = 3;
+        state.n_segments = 2;
+        return state;
+    }
     if (std::strcmp(tensor->name, "axis2") == 0) {
         state.axis = GGML_BACKEND_SPLIT_AXIS_2;
         state.ne[0] = tensor->ne[2] / 2;
@@ -53,6 +64,22 @@ static ggml_backend_meta_split_state split_state(
         state.axis = GGML_BACKEND_SPLIT_AXIS_1;
         state.ne[0] = tensor->ne[1] / 2;
         state.ne[1] = tensor->ne[1] - state.ne[0];
+        state.nr[0] = 1;
+        state.n_segments = 1;
+        return state;
+    }
+    if (std::strcmp(tensor->name, "zero_column_weight") == 0) {
+        state.axis = GGML_BACKEND_SPLIT_AXIS_1;
+        state.ne[0] = tensor->ne[1];
+        state.ne[1] = 0;
+        state.nr[0] = 1;
+        state.n_segments = 1;
+        return state;
+    }
+    if (std::strcmp(tensor->name, "zero_row_weight") == 0) {
+        state.axis = GGML_BACKEND_SPLIT_AXIS_0;
+        state.ne[0] = tensor->ne[0];
+        state.ne[1] = 0;
         state.nr[0] = 1;
         state.n_segments = 1;
         return state;
@@ -82,6 +109,19 @@ static ggml_backend_meta_split_state split_state(
 int main() {
     ggml_backend_load_all();
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+    const ggml_backend_meta_split_state legacy_positional = {
+        GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, 1
+    };
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+    CHECK(legacy_positional.n_segments == 1);
+    CHECK(legacy_positional.nr[0] == 0);
+
     const char * first_name = std::getenv("GGML_META_TEST_DEVICE_0");
     const char * second_name = std::getenv("GGML_META_TEST_DEVICE_1");
     first_name = first_name ? first_name : "CUDA0";
@@ -98,6 +138,11 @@ int main() {
     }
 
     size_t n_devices = 2;
+    CHECK(ggml_backend_meta_device(nullptr, 0, split_state, &n_devices) == nullptr);
+    std::vector<ggml_backend_dev_t> too_many(
+        GGML_BACKEND_META_MAX_DEVICES + 1, devices[0]);
+    CHECK(ggml_backend_meta_device(too_many.data(), too_many.size(),
+                                   split_state, &n_devices) == nullptr);
     ggml_backend_dev_t meta_device =
         ggml_backend_meta_device(devices, n_devices, split_state, &n_devices);
     CHECK(meta_device);
@@ -121,6 +166,9 @@ int main() {
     ggml_tensor * axis2 =
         ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 3, 12, 2);
     ggml_set_name(axis2, "axis2");
+    ggml_tensor * multi_repeat =
+        ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 2);
+    ggml_set_name(multi_repeat, "multi_repeat");
 
     ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
     CHECK(buffer);
@@ -138,10 +186,32 @@ int main() {
     for (size_t i = 0; i < input.size(); ++i) input[i] = (float) i + 0.25f;
     ggml_backend_tensor_set(repeated, input.data(), 0, input.size() * sizeof(float));
     ggml_backend_tensor_set(mirrored, input.data(), 0, input.size() * sizeof(float));
+    std::vector<float> multi_repeat_input(
+        (size_t) ggml_nelements(multi_repeat));
+    for (size_t i = 0; i < multi_repeat_input.size(); ++i) {
+        multi_repeat_input[i] = (float) i + 1.25f;
+    }
+    ggml_backend_tensor_set(multi_repeat, multi_repeat_input.data(), 0,
+                            multi_repeat_input.size() * sizeof(float));
 
     std::vector<float> output(input.size(), 0.0f);
     ggml_backend_tensor_get(repeated, output.data(), 0, output.size() * sizeof(float));
     CHECK(output == input);
+
+    std::vector<float> async_input(input.size());
+    for (size_t i = 0; i < async_input.size(); ++i) {
+        async_input[i] = -(float) i - 0.5f;
+    }
+    ggml_backend_tensor_set_async(backend, repeated, async_input.data(), 0,
+                                  async_input.size() * sizeof(float));
+    ggml_backend_synchronize(backend);
+    std::fill(output.begin(), output.end(), 0.0f);
+    ggml_backend_tensor_get_async(backend, repeated, output.data(), 0,
+                                  output.size() * sizeof(float));
+    ggml_backend_synchronize(backend);
+    CHECK(output == async_input);
+    ggml_backend_tensor_set(repeated, input.data(), 0,
+                            input.size() * sizeof(float));
     std::fill(output.begin(), output.end(), 0.0f);
     ggml_backend_tensor_get(mirrored, output.data(), 0, output.size() * sizeof(float));
     CHECK(output == input);
@@ -215,6 +285,12 @@ int main() {
     ggml_tensor * row_weight =
         ggml_new_tensor_2d(weight_ctx, GGML_TYPE_F32, 8, 4);
     ggml_set_name(row_weight, "row_weight");
+    ggml_tensor * zero_column_weight =
+        ggml_new_tensor_2d(weight_ctx, GGML_TYPE_F32, 4, 8);
+    ggml_set_name(zero_column_weight, "zero_column_weight");
+    ggml_tensor * zero_row_weight =
+        ggml_new_tensor_2d(weight_ctx, GGML_TYPE_F32, 8, 4);
+    ggml_set_name(zero_row_weight, "zero_row_weight");
     ggml_backend_buffer_t weight_buffer =
         ggml_backend_alloc_ctx_tensors(weight_ctx, backend);
     CHECK(weight_buffer);
@@ -230,6 +306,13 @@ int main() {
     ggml_tensor * mat_input =
         ggml_new_tensor_2d(graph_ctx, GGML_TYPE_F32, 4, 2);
     ggml_set_name(mat_input, "mat_input");
+    ggml_tensor * multi_repeat_transposed =
+        ggml_transpose(graph_ctx, multi_repeat);
+    ggml_set_name(multi_repeat_transposed, "multi_repeat_transposed");
+    ggml_tensor * multi_repeat_contiguous =
+        ggml_cont(graph_ctx, multi_repeat_transposed);
+    ggml_set_name(multi_repeat_contiguous, "multi_repeat_contiguous");
+    ggml_set_output(multi_repeat_contiguous);
     ggml_tensor * mat_hidden =
         ggml_mul_mat(graph_ctx, column_weight, mat_input);
     ggml_set_name(mat_hidden, "mat_hidden");
@@ -238,15 +321,33 @@ int main() {
     ggml_tensor * mat_output = ggml_scale(graph_ctx, mat_result, 1.0f);
     ggml_set_name(mat_output, "mat_output");
     ggml_set_output(mat_output);
+    ggml_tensor * zero_hidden =
+        ggml_mul_mat(graph_ctx, zero_column_weight, mat_input);
+    ggml_set_name(zero_hidden, "zero_hidden");
+    ggml_tensor * zero_result =
+        ggml_mul_mat(graph_ctx, zero_row_weight, zero_hidden);
+    ggml_set_name(zero_result, "zero_result");
+    ggml_tensor * zero_output = ggml_scale(graph_ctx, zero_result, 1.0f);
+    ggml_set_name(zero_output, "zero_output");
+    ggml_set_output(zero_output);
     ggml_cgraph * graph =
         ggml_new_graph_custom(graph_ctx, graph_nodes, false);
+    ggml_build_forward_expand(graph, multi_repeat_contiguous);
     ggml_build_forward_expand(graph, mat_output);
+    ggml_build_forward_expand(graph, zero_output);
     ggml_gallocr_t graph_alloc =
         ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     CHECK(graph_alloc);
     CHECK(ggml_gallocr_alloc_graph(graph_alloc, graph));
     CHECK(ggml_backend_meta_simple_tensor(mat_output, 0));
     CHECK(ggml_backend_meta_simple_tensor(mat_output, 1));
+    ggml_tensor * zero_result_rank_1 =
+        ggml_backend_meta_simple_tensor(zero_result, 1);
+    CHECK(zero_result_rank_1);
+    std::vector<float> poisoned((size_t) ggml_nelements(zero_result_rank_1),
+                                NAN);
+    ggml_backend_tensor_set(zero_result_rank_1, poisoned.data(), 0,
+                            poisoned.size() * sizeof(float));
 
     std::vector<float> column_data((size_t) ggml_nelements(column_weight));
     std::vector<float> row_data((size_t) ggml_nelements(row_weight));
@@ -264,13 +365,32 @@ int main() {
                             column_data.size() * sizeof(float));
     ggml_backend_tensor_set(row_weight, row_data.data(), 0,
                             row_data.size() * sizeof(float));
+    ggml_backend_tensor_set(zero_column_weight, column_data.data(), 0,
+                            column_data.size() * sizeof(float));
+    ggml_backend_tensor_set(zero_row_weight, row_data.data(), 0,
+                            row_data.size() * sizeof(float));
     ggml_backend_tensor_set(mat_input, mat_input_data.data(), 0,
                             mat_input_data.size() * sizeof(float));
     CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
 
+    std::vector<float> multi_repeat_output(
+        (size_t) ggml_nelements(multi_repeat_contiguous));
+    ggml_backend_tensor_get(multi_repeat_contiguous,
+                            multi_repeat_output.data(), 0,
+                            multi_repeat_output.size() * sizeof(float));
+    for (int64_t row = 0; row < multi_repeat->ne[1]; ++row) {
+        for (int64_t column = 0; column < multi_repeat->ne[0]; ++column) {
+            CHECK(multi_repeat_output[(size_t) column * multi_repeat->ne[1] + row] ==
+                  multi_repeat_input[(size_t) row * multi_repeat->ne[0] + column]);
+        }
+    }
+
     std::vector<float> result((size_t) ggml_nelements(mat_output));
     ggml_backend_tensor_get(mat_output, result.data(), 0,
                             result.size() * sizeof(float));
+    std::vector<float> zero_result_host((size_t) ggml_nelements(zero_output));
+    ggml_backend_tensor_get(zero_output, zero_result_host.data(), 0,
+                            zero_result_host.size() * sizeof(float));
     std::vector<float> hidden(16, 0.0f);
     for (int column = 0; column < 2; ++column) {
         for (int row = 0; row < 8; ++row) {
@@ -295,6 +415,10 @@ int main() {
                     column, row, actual, expected);
             }
             CHECK(std::fabs(actual - expected) < 1e-5f);
+            const float zero_actual =
+                zero_result_host[(size_t) column * 4 + row];
+            CHECK(std::isfinite(zero_actual));
+            CHECK(std::fabs(zero_actual - expected) < 1e-5f);
         }
     }
 
